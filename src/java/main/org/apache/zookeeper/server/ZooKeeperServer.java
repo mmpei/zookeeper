@@ -74,6 +74,9 @@ import org.slf4j.LoggerFactory;
  */
 public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     protected static final Logger LOG;
+    public static final String ALLOW_SASL_FAILED_CLIENTS = "zookeeper.allowSaslFailedClients";
+    public static final String SESSION_REQUIRE_CLIENT_SASL_AUTH = "zookeeper.sessionRequireClientSASLAuth";
+    public static final String SASL_AUTH_SCHEME = "sasl";
     
     static {
         LOG = LoggerFactory.getLogger(ZooKeeperServer.class);
@@ -902,21 +905,52 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             return;
         } else {
             if (h.getType() == OpCode.sasl) {
-                Record rsp = processSasl(incomingBuffer,cnxn);
-                ReplyHeader rh = new ReplyHeader(h.getXid(), 0, KeeperException.Code.OK.intValue());
-                cnxn.sendResponse(rh,rsp, "response"); // not sure about 3rd arg..what is it?
+                processSasl(incomingBuffer,cnxn, h);
+//                Record rsp = processSasl(incomingBuffer,cnxn);
+//                ReplyHeader rh = new ReplyHeader(h.getXid(), 0, KeeperException.Code.OK.intValue());
+//                cnxn.sendResponse(rh,rsp, "response"); // not sure about 3rd arg..what is it?
             }
             else {
-                Request si = new Request(cnxn, cnxn.getSessionId(), h.getXid(),
-                  h.getType(), incomingBuffer, cnxn.getAuthInfo());
-                si.setOwner(ServerCnxn.me);
-                submitRequest(si);
+                if (shouldRequireClientSaslAuth() && !hasCnxSASLAuthenticated(cnxn)) {
+                    ReplyHeader replyHeader = new ReplyHeader(h.getXid(), 0,
+                            Code.SESSIONCLOSEDREQUIRESASLAUTH.intValue());
+                    cnxn.sendResponse(replyHeader, null, "response");
+                    cnxn.sendCloseSession();
+                    cnxn.disableRecv();
+                } else {
+                    Request si = new Request(cnxn, cnxn.getSessionId(), h.getXid(),
+                        h.getType(), incomingBuffer, cnxn.getAuthInfo());
+                    si.setOwner(ServerCnxn.me);
+                    submitRequest(si);
+                }
+//                Request si = new Request(cnxn, cnxn.getSessionId(), h.getXid(),
+//                  h.getType(), incomingBuffer, cnxn.getAuthInfo());
+//                si.setOwner(ServerCnxn.me);
+//                submitRequest(si);
             }
         }
-        cnxn.incrOutstandingRequests(h);
+//        cnxn.incrOutstandingRequests(h);
     }
 
-    private Record processSasl(ByteBuffer incomingBuffer, ServerCnxn cnxn) throws IOException {
+    private static boolean shouldAllowSaslFailedClientsConnect() {
+        return Boolean.getBoolean(ALLOW_SASL_FAILED_CLIENTS);
+    }
+
+    private static boolean shouldRequireClientSaslAuth() {
+        return Boolean.getBoolean(SESSION_REQUIRE_CLIENT_SASL_AUTH);
+    }
+
+    private boolean hasCnxSASLAuthenticated(ServerCnxn cnxn) {
+        for (Id id : cnxn.getAuthInfo()) {
+            if (id.getScheme().equals(SASL_AUTH_SCHEME)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void processSasl(ByteBuffer incomingBuffer, ServerCnxn cnxn,
+                             RequestHeader requestHeader) throws IOException {
         LOG.debug("Responding to client SASL token.");
         GetSASLRequest clientTokenRecord = new GetSASLRequest();
         ByteBufferInputStream.byteBuffer2Record(incomingBuffer,clientTokenRecord);
@@ -938,14 +972,22 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             }
             catch (SaslException e) {
                 LOG.warn("Client failed to SASL authenticate: " + e);
-                if ((System.getProperty("zookeeper.allowSaslFailedClients") != null)
-                  &&
-                  (System.getProperty("zookeeper.allowSaslFailedClients").equals("true"))) {
-                    LOG.warn("Maintaining client connection despite SASL authentication failure.");
+                int error;
+                if (shouldRequireClientSaslAuth()) {
+                    LOG.warn("Closing client connection due to server requires client SASL authenticaiton," +
+                            "but client SASL authentication has failed, or client is not configured with SASL " +
+                            "authentication.");
+                    error = Code.SESSIONCLOSEDREQUIRESASLAUTH.intValue();
                 } else {
                     LOG.warn("Closing client connection due to SASL authentication failure.");
-                    cnxn.close();
+                    error = Code.AUTHFAILED.intValue();
                 }
+
+                ReplyHeader replyHeader = new ReplyHeader(requestHeader.getXid(), 0, error);
+                cnxn.sendResponse(replyHeader, new SetSASLResponse(null), "response");
+                cnxn.sendCloseSession();
+                cnxn.disableRecv();
+                return;
             }
         }
         catch (NullPointerException e) {
@@ -954,8 +996,9 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         if (responseToken != null) {
             LOG.debug("Size of server SASL response: " + responseToken.length);
         }
-        // wrap SASL response token to client inside a Response object.
-        return new SetSASLResponse(responseToken);
+        ReplyHeader replyHeader = new ReplyHeader(requestHeader.getXid(), 0, Code.OK.intValue());
+        Record record = new SetSASLResponse(responseToken);
+        cnxn.sendResponse(replyHeader, record, "response");
     }
     
     public ProcessTxnResult processTxn(TxnHeader hdr, Record txn) {
