@@ -345,7 +345,12 @@ public abstract class KeeperException extends Exception {
         /** Session moved to another server, so operation is ignored */
         SESSIONMOVED (-118),
         /** State-changing request is passed to read-only server */
-        NOTREADONLY (-119);
+        NOTREADONLY (-119),
+        RECONFIGDISABLED(-123),
+        /** The session has been closed by server because server requires client to do SASL authentication,
+         *  but client is not configured with SASL authentication or configuted with SASL but failed
+         *  (i.e. wrong credential used.). */
+        SESSIONCLOSEDREQUIRESASLAUTH(-124);
 
         private static final Map<Integer,Code> lookup
             = new HashMap<Integer,Code>();
